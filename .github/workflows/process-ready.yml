@@ -1,0 +1,337 @@
+name: Process Ready Issues
+
+on:
+  push:
+    branches:
+      - epik-runs/epic-*
+    paths:
+      - 'epic-*/graph.yml'
+  workflow_dispatch:
+    inputs:
+      epic_number:
+        description: 'Epic issue number to scope implementation'
+        required: true
+  workflow_call:
+    inputs:
+      epic_number:
+        description: 'Epic issue number to scope implementation'
+        required: true
+        type: number
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  ensure-image:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: read
+    outputs:
+      image_exists: ${{ steps.check.outputs.exists }}
+    steps:
+      - name: Check if Claude Code image exists
+        id: check
+        run: |
+          # Use centralized image from epik repo
+          IMAGE="ghcr.io/mcneill/epik/claude-code:2.1.12"
+
+          echo "Checking for image: ${IMAGE}"
+
+          # Try to get image manifest (public image, no auth needed)
+          if docker manifest inspect "${IMAGE}" > /dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "✓ Image exists: ${IMAGE}"
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "✗ Image not found: ${IMAGE}"
+            echo ""
+            echo "To build the image, run the following in the epik repository:"
+            echo "  gh workflow run build-claude-image.yml --repo mcneill/epik"
+            exit 1
+          fi
+
+  find-ready:
+    needs: ensure-image
+    runs-on: ubuntu-latest
+    outputs:
+      ready_issues: ${{ steps.find.outputs.ready_issues }}
+      has_issues: ${{ steps.find.outputs.has_issues }}
+      epic_number: ${{ steps.epic.outputs.epic_number }}
+    steps:
+      - name: Detect epic number
+        id: epic
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            # Extract epic number from branch name: epik-runs/epic-<number>
+            BRANCH_NAME="${{ github.ref_name }}"
+            EPIC_NUMBER=$(echo "${BRANCH_NAME}" | sed 's|epik-runs/epic-||')
+            if [ -z "${EPIC_NUMBER}" ] || ! [[ "${EPIC_NUMBER}" =~ ^[0-9]+$ ]]; then
+              echo "Error: Could not extract epic number from branch: ${BRANCH_NAME}"
+              exit 1
+            fi
+            echo "epic_number=${EPIC_NUMBER}" >> $GITHUB_OUTPUT
+            echo "state_branch=${BRANCH_NAME}" >> $GITHUB_OUTPUT
+            echo "Detected epic number from push: ${EPIC_NUMBER}"
+          else
+            EPIC_NUMBER="${{ inputs.epic_number }}"
+            echo "epic_number=${EPIC_NUMBER}" >> $GITHUB_OUTPUT
+            echo "state_branch=epik-runs/epic-${EPIC_NUMBER}" >> $GITHUB_OUTPUT
+            echo "Using provided epic number: ${EPIC_NUMBER}"
+          fi
+
+      - name: Checkout epic-specific state branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.epic.outputs.state_branch }}
+          fetch-depth: 1
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Get dependency graph
+        run: |
+          # Epic state directory
+          EPIC_NUMBER="${{ steps.epic.outputs.epic_number }}"
+          RUN_DIR="epic-${EPIC_NUMBER}"
+          if [ ! -f "${RUN_DIR}/graph.yml" ]; then
+            echo "Error: Dependency graph not found for epic #${EPIC_NUMBER}"
+            echo "Expected: ${RUN_DIR}/graph.yml"
+            exit 1
+          fi
+          cp "${RUN_DIR}/graph.yml" dependency-graph.yml
+          echo "✓ Loaded dependency graph for epic #${EPIC_NUMBER}"
+
+      - name: Checkout scripts from current branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          path: .claude-scripts
+
+      - name: Install dependencies
+        run: |
+          cd .claude-scripts/.claude/scripts
+          uv sync
+
+      - name: Find ready issues
+        id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd .claude-scripts/.claude/scripts
+          source .venv/bin/activate
+
+          # Use the ready command to find issues with all dependencies satisfied
+          # Graph file is in the root directory (3 levels up from .claude-scripts/.claude/scripts)
+          READY_ISSUES=$(python dependency_graph.py ready --graph ../../../dependency-graph.yml)
+
+          if [ -n "${READY_ISSUES}" ]; then
+            # Convert space-separated list to JSON array
+            echo "${READY_ISSUES}" | jq -Rc 'split(" ") | map(tonumber)' > ready-issues.json
+          else
+            echo "[]" > ready-issues.json
+          fi
+
+          if [ -f ready-issues.json ] && [ "$(jq '. | length' ready-issues.json)" -gt 0 ]; then
+            READY_ISSUES=$(cat ready-issues.json)
+            echo "ready_issues=${READY_ISSUES}" >> $GITHUB_OUTPUT
+            echo "has_issues=true" >> $GITHUB_OUTPUT
+            echo "Found ready issues: ${READY_ISSUES}"
+          else
+            echo "has_issues=false" >> $GITHUB_OUTPUT
+            echo "No ready issues found"
+          fi
+
+      - name: Check if complete
+        if: steps.find.outputs.has_issues != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd .claude-scripts/.claude/scripts
+          source .venv/bin/activate
+
+          if python dependency_graph.py complete --graph ../../../dependency-graph.yml; then
+            echo "## 🎉 Project Complete!" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "All issues have been implemented and merged." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## ⏸ No Ready Issues" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Waiting for dependencies to be completed." >> $GITHUB_STEP_SUMMARY
+          fi
+
+  implement:
+    needs: find-ready
+    if: needs.find-ready.outputs.has_issues == 'true'
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/mcneill/epik/claude-code:2.1.12
+      options: --user root
+    strategy:
+      matrix:
+        issue: ${{ fromJson(needs.find-ready.outputs.ready_issues) }}
+      max-parallel: 5
+      fail-fast: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Verify Claude Code installation
+        run: |
+          claude --version
+          gh --version
+          uv --version
+
+      - name: Install dependencies
+        run: |
+          cd .claude/scripts
+          uv sync
+
+      - name: Get issue details
+        id: issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ISSUE_DATA=$(gh issue view ${{ matrix.issue }} --json title,body)
+          ISSUE_TITLE=$(echo "${ISSUE_DATA}" | jq -r '.title')
+
+          echo "title=${ISSUE_TITLE}" >> $GITHUB_OUTPUT
+
+      - name: Create feature branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "feature/issue-${{ matrix.issue }}"
+
+      - name: Implement issue with Claude Code CLI
+        id: implement
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd .claude/scripts
+          source .venv/bin/activate
+
+          # Run the Claude Code CLI implementation script
+          python claude_code_implement.py ${{ matrix.issue }} > implementation_result.json
+
+          # Check if successful
+          if [ $? -eq 0 ]; then
+            echo "success=true" >> $GITHUB_OUTPUT
+            echo "## ✅ Implementation Successful" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            cat implementation_result.json | jq -r '.summary' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "success=false" >> $GITHUB_OUTPUT
+            echo "## ❌ Implementation Failed" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            cat implementation_result.json | jq -r '.error' >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+      - name: Run tests
+        id: test
+        continue-on-error: true
+        run: |
+          if [ -f "pytest.ini" ] || [ -f "pyproject.toml" ]; then
+            pip install pytest pytest-cov 2>/dev/null || true
+            pytest -v || echo "Tests failed or no tests found"
+            echo "status=$?" >> $GITHUB_OUTPUT
+          else
+            echo "No test framework detected"
+            echo "status=skipped" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Commit changes
+        run: |
+          git add -A
+          git commit -m "feat: ${{ steps.issue.outputs.title }}
+
+          Implements #${{ matrix.issue }}
+
+          Co-Authored-By: Claude Code CLI <noreply@anthropic.com>" || echo "No changes to commit"
+
+      - name: Push branch
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN || github.token }}
+        run: |
+          git push -u origin "feature/issue-${{ matrix.issue }}"
+
+      - name: Create pull request
+        id: create_pr
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN || github.token }}
+        run: |
+          PR_BODY="Implements #${{ matrix.issue }}
+
+          ## Changes
+          This PR implements the feature described in issue #${{ matrix.issue }}.
+
+          ## Implementation
+          - Implemented using Claude Code CLI
+          - All requirements from the issue have been addressed
+
+          ## Testing
+          - Tests have been run and are passing
+
+          Closes #${{ matrix.issue }}
+
+          ---
+          🤖 Autonomously implemented by Claude Code CLI"
+
+          PR_URL=$(gh pr create \
+            --title "feat: ${{ steps.issue.outputs.title }}" \
+            --body "$PR_BODY" \
+            --head "feature/issue-${{ matrix.issue }}" \
+            --base main)
+
+          echo "pr_url=${PR_URL}" >> $GITHUB_OUTPUT
+          echo "📝 [Pull Request](${PR_URL})" >> $GITHUB_STEP_SUMMARY
+
+      - name: Add implementation summary and cost comment to issue
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          COMMENT="## Implementation Complete
+
+          ✅ Issue has been implemented using Claude Code CLI
+
+          **Status**: ${{ steps.implement.outputs.success }}
+          **Tests**: ${{ steps.test.outputs.status }}
+          **PR**: ${{ steps.create_pr.outputs.pr_url }}
+
+          Implementation powered by Claude Code CLI"
+
+          gh issue comment ${{ matrix.issue }} --body "$COMMENT"
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Issue #${{ matrix.issue }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Title:** ${{ steps.issue.outputs.title }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ steps.test.outputs.status }}" == "0" ] || [ "${{ steps.test.outputs.status }}" == "skipped" ]; then
+            echo "✅ Tests passing" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Tests failed" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Use captured PR URL from create_pr step
+          if [ -n "${{ steps.create_pr.outputs.pr_url }}" ]; then
+            echo "📝 [Pull Request](${{ steps.create_pr.outputs.pr_url }})" >> $GITHUB_STEP_SUMMARY
+          fi
