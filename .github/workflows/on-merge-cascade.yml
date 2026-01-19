@@ -1,0 +1,215 @@
+name: On PR Merge - Cascade to Next Issues
+
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: write
+  actions: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  cascade:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract closed issue number and find epic
+        id: issue_extract
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Extract issue number from PR body
+          PR_BODY="${{ github.event.pull_request.body }}"
+
+          # Look for "Closes #N" pattern
+          ISSUE_NUM=$(echo "${PR_BODY}" | grep -oP '(?i)closes\s+#\K\d+' | head -1)
+
+          if [ -z "${ISSUE_NUM}" ]; then
+            echo "Warning: Could not extract issue number from PR body"
+            echo "number=" >> $GITHUB_OUTPUT
+            exit 0
+          else
+            echo "number=${ISSUE_NUM}" >> $GITHUB_OUTPUT
+            echo "Closed issue: #${ISSUE_NUM}"
+          fi
+
+      - name: Find epic from issue parent
+        id: find_run
+        if: steps.issue_extract.outputs.number != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ISSUE_NUM="${{ steps.issue_extract.outputs.number }}"
+
+          # Get repository owner and name
+          REPO_INFO=$(gh repo view --json owner,name)
+          OWNER=$(echo "$REPO_INFO" | jq -r '.owner.login')
+          NAME=$(echo "$REPO_INFO" | jq -r '.name')
+
+          # Get issue parent using GraphQL sub-issues feature
+          GRAPHQL_QUERY='query {
+            repository(owner: "'${OWNER}'", name: "'${NAME}'") {
+              issue(number: '${ISSUE_NUM}') {
+                parent {
+                  number
+                }
+              }
+            }
+          }'
+
+          EPIC_NUMBER=$(gh api graphql -H "GraphQL-Features: sub_issues" \
+            -f query="${GRAPHQL_QUERY}" \
+            --jq '.data.repository.issue.parent.number // empty')
+
+          if [ -z "${EPIC_NUMBER}" ]; then
+            echo "No parent epic found for issue #${ISSUE_NUM} - skipping cascade"
+            echo "epic_number=" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "epic_number=${EPIC_NUMBER}" >> $GITHUB_OUTPUT
+          echo "state_branch=epik-runs/epic-${EPIC_NUMBER}" >> $GITHUB_OUTPUT
+          echo "Epic number from issue parent: #${EPIC_NUMBER}"
+
+      - name: Checkout epic-specific state branch
+        if: steps.find_run.outputs.epic_number != ''
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.find_run.outputs.state_branch }}
+          fetch-depth: 1
+
+      - name: Verify epic state
+        if: steps.find_run.outputs.epic_number != ''
+        run: |
+          EPIC_NUMBER="${{ steps.find_run.outputs.epic_number }}"
+          RUN_DIR="epic-${EPIC_NUMBER}"
+
+          # Check if epic directory exists
+          if [ ! -d "${RUN_DIR}" ]; then
+            echo "Warning: Epic directory not found: ${RUN_DIR}"
+            exit 0
+          fi
+
+          echo "Active epic: #${EPIC_NUMBER} (${RUN_DIR})"
+
+      - name: Update run status
+        if: steps.issue_extract.outputs.number != '' && steps.find_run.outputs.epic_number != ''
+        env:
+          # Use PAT if available, otherwise GITHUB_TOKEN
+          GIT_TOKEN: ${{ secrets.PAT_TOKEN || github.token }}
+          STATUS_FILE: epic-${{ steps.find_run.outputs.epic_number }}/status.yml
+        run: |
+          RUN_DIR="epic-${{ steps.find_run.outputs.epic_number }}"
+          STATUS_FILE="${RUN_DIR}/status.yml"
+
+          # Add closed issue to status
+          python3 << 'PYTHON'
+          import yaml
+          from pathlib import Path
+
+          status_file = Path("${{ env.STATUS_FILE }}")
+          with open(status_file) as f:
+              status = yaml.safe_load(f)
+
+          if "completed_issues" not in status:
+              status["completed_issues"] = []
+
+          issue_num = int("${{ steps.issue_extract.outputs.number }}")
+          if issue_num not in status["completed_issues"]:
+              status["completed_issues"].append(issue_num)
+              status["completed_issues"].sort()
+
+          with open(status_file, "w") as f:
+              yaml.safe_dump(status, f, default_flow_style=False)
+          PYTHON
+
+          # Commit updated status
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Configure remote to use token for push
+          git remote set-url origin "https://x-access-token:${GIT_TOKEN}@github.com/${{ github.repository }}.git"
+
+          git add "${STATUS_FILE}"
+          git commit -m "chore: mark issue #${{ steps.issue_extract.outputs.number }} as completed"
+          git push
+
+      - name: Check if project complete
+        id: complete
+        if: steps.find_run.outputs.epic_number != ''
+        run: |
+          # Checkout main branch to get the dependency graph script
+          git fetch origin ${{ github.event.repository.default_branch }}
+          git checkout origin/${{ github.event.repository.default_branch }} -- .claude/scripts/
+
+          # Setup Python
+          python3 -m venv .venv
+          source .venv/bin/activate
+          pip install pyyaml typer loguru pydantic
+
+          # Get the dependency graph for this run
+          RUN_DIR="epic-${{ steps.find_run.outputs.epic_number }}"
+          GRAPH_FILE="${RUN_DIR}/graph.yml"
+
+          cd .claude/scripts
+
+          # Check if complete
+          if python dependency_graph.py complete --graph "../../${GRAPH_FILE}"; then
+            echo "complete=true" >> $GITHUB_OUTPUT
+            echo "Epic is complete!"
+          else
+            echo "complete=false" >> $GITHUB_OUTPUT
+            echo "Epic not yet complete"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Trigger notification for next ready issues
+        if: steps.complete.outputs.complete != 'true' && steps.find_run.outputs.epic_number != ''
+        env:
+          # Use PAT if available for auto-trigger, otherwise GITHUB_TOKEN (manual trigger needed)
+          GH_TOKEN: ${{ secrets.PAT_TOKEN || github.token }}
+        run: |
+          # Trigger the process-ready workflow for next wave
+          gh workflow run process-ready.yml \
+            -f epic_number="${{ steps.find_run.outputs.epic_number }}"
+
+          if [ -n "${{ secrets.PAT_TOKEN }}" ]; then
+            echo "✓ Triggered process-ready workflow with PAT_TOKEN"
+          else
+            echo "⚠️  Attempted trigger with GITHUB_TOKEN - may require manual trigger"
+            echo "   To enable auto-trigger, add PAT_TOKEN secret (see README)"
+          fi
+
+      - name: Epic completion notification
+        if: steps.complete.outputs.complete == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Comment on epic issue
+          gh issue comment ${{ steps.find_run.outputs.epic_number }} \
+            --body "🎉 **Epic Complete!** All child issues have been implemented and merged."
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Merge Cascade" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**PR:** #${{ github.event.pull_request.number }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Closed Issue:** #${{ steps.issue_extract.outputs.number }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Epic:** #${{ steps.find_run.outputs.epic_number }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ steps.complete.outputs.complete }}" == "true" ]; then
+            echo "🎉 **Epic Complete!**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "🔄 Triggered notification for newly ready issues" >> $GITHUB_STEP_SUMMARY
+          fi
